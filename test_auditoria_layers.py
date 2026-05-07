@@ -69,8 +69,10 @@ def conectar_autocad():
     pythoncom.CoInitialize()
     try:
         acad = win32com.client.GetActiveObject("AutoCAD.Application")
-        # Silenciar diálogos y errores de AutoCAD
-        acad.Application.Preferences.OpenSave.DemandLoadARXApp = 2
+        try:
+            acad.Preferences.OpenSave.DemandLoadARXApp = 2
+        except Exception:
+            pass
         ok(f"AutoCAD conectado: {acad.Version}")
         return acad
     except Exception as e:
@@ -79,14 +81,28 @@ def conectar_autocad():
         sys.exit(1)
 
 
+def _suprimir_dialogs(acad):
+    for var, val in [("XLOADCTL", 0), ("FILEDIA", 0), ("EXPERT", 5), ("PROXYSHOW", 0)]:
+        try:
+            acad.SetSystemVariable(var, val)
+        except Exception:
+            pass
+
+def _restaurar_dialogs(acad):
+    for var, val in [("XLOADCTL", 2), ("FILEDIA", 1), ("EXPERT", 0), ("PROXYSHOW", 1)]:
+        try:
+            acad.SetSystemVariable(var, val)
+        except Exception:
+            pass
+
+
 def abrir_dwg(acad, ruta):
-    """Abre el DWG en modo solo-lectura para que sea más rápido y no bloquee el archivo."""
     ruta_abs = os.path.abspath(ruta)
+    _suprimir_dialogs(acad)
     for intento in range(1, 4):
         try:
-            # True = read-only: más rápido y no modifica el archivo
             doc = acad.Documents.Open(ruta_abs, True)
-            time.sleep(0.5)   # mínimo para que AutoCAD termine de cargar
+            time.sleep(0.5)
             return doc
         except Exception as e:
             if intento < 3:
@@ -374,6 +390,7 @@ def main():
         r = analizar(acad, ruta, i, len(archivos))
         resultados.append(r)
 
+    _restaurar_dialogs(acad)
     try:
         pythoncom.CoUninitialize()
     except Exception:

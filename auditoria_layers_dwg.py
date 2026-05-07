@@ -22,6 +22,7 @@ import os
 import sys
 import json
 import time
+import threading
 import argparse
 from datetime import datetime
 
@@ -65,29 +66,47 @@ log = Logger()
 
 # ──────────────────────────────────────────────────────────
 # CHECKPOINT — guardar y cargar progreso
+# Estructura JSON:
+#   {
+#     "completados": { vehiculo: [filas], ... },   ← vehículos 100% listos
+#     "en_curso":    { "vehiculo": "CHEVROLET",    ← vehículo parcialmente procesado
+#                      "filas":   [filas...] }
+#   }
 # ──────────────────────────────────────────────────────────
+GUARDAR_CADA_N = 5   # guardar checkpoint cada N archivos dentro de un vehículo
+
 def checkpoint_cargar(ruta_archivo):
-    """Carga el checkpoint si existe. Retorna dict {vehiculo: [filas]} o {}."""
     if not os.path.exists(ruta_archivo):
-        return {}
+        return {}, None, []
     try:
         with open(ruta_archivo, "r", encoding="utf-8") as f:
-            datos = json.load(f)
-        log.ok(f"Checkpoint cargado: {len(datos)} vehículo(s) ya procesados")
-        return datos
+            raw = json.load(f)
+        completados = raw.get("completados", {})
+        en_curso    = raw.get("en_curso", {})
+        vehiculo_parcial = en_curso.get("vehiculo")
+        filas_parciales  = en_curso.get("filas", [])
+        total_dwg = sum(len(v) for v in completados.values()) + len(filas_parciales)
+        log.ok(f"Checkpoint: {len(completados)} vehículo(s) completos, "
+               f"{len(filas_parciales)} DWG(s) del vehículo en curso "
+               f"({vehiculo_parcial or '—'})  —  {total_dwg} DWG(s) en total")
+        return completados, vehiculo_parcial, filas_parciales
     except Exception as e:
         log.warn(f"No se pudo leer el checkpoint ({e}), se empieza desde cero")
-        return {}
+        return {}, None, []
 
 
-def checkpoint_guardar(ruta_archivo, datos):
-    """Guarda el estado actual al disco. Se llama después de cada vehículo."""
+def checkpoint_guardar(ruta_archivo, completados, vehiculo_en_curso=None, filas_en_curso=None):
     try:
-        # Escritura atómica: escribe en .tmp y luego renombra para evitar corrupción
+        payload = {
+            "completados": completados,
+            "en_curso": {
+                "vehiculo": vehiculo_en_curso or "",
+                "filas":    filas_en_curso   or [],
+            }
+        }
         tmp = ruta_archivo + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(datos, f, ensure_ascii=False)
-        # En Windows replace es atómico
+            json.dump(payload, f, ensure_ascii=False)
         os.replace(tmp, ruta_archivo)
     except Exception as e:
         log.warn(f"Error guardando checkpoint: {e}")
@@ -131,53 +150,144 @@ class AutoCAD:
             log.error("Abre AutoCAD (sin ningún archivo) y vuelve a ejecutar.")
             sys.exit(1)
 
-    def vivo(self):
-        """Verifica que AutoCAD sigue respondiendo."""
-        try:
-            _ = self.app.Version
-            return True
-        except Exception:
-            return False
-
-    def abrir(self, ruta):
-        ruta_abs = os.path.abspath(ruta)
-        for intento in range(1, 4):
+    def _suprimir_dialogs(self):
+        """
+        Desactiva todo lo que puede hacer que AutoCAD se trabe al abrir un DWG:
+          XLOADCTL 0  → no carga XREFs (causa #1 de trabas en red)
+          FILEDIA  0  → suprime diálogos de archivos
+          EXPERT   5  → suprime todos los prompts de confirmación
+          PROXYSHOW 0 → no intenta dibujar objetos proxy
+        """
+        for var, val in [("XLOADCTL", 0), ("FILEDIA", 0), ("EXPERT", 5), ("PROXYSHOW", 0)]:
             try:
-                doc = self.app.Documents.Open(ruta_abs, True)  # True = solo lectura
-                time.sleep(0.5)
-                return doc
-            except Exception as e:
-                if intento < 3:
-                    log.warn(f"  Reintento {intento}/3: {str(e)[:60]}")
-                    time.sleep(intento * 1.5)
-        return None
+                self.app.SetSystemVariable(var, val)
+            except Exception:
+                pass
 
-    def cerrar(self, doc):
-        try:
-            doc.Close(False)
-            time.sleep(0.1)
-        except Exception:
-            pass
+    def _restaurar_dialogs(self):
+        """Restaura variables para uso normal de AutoCAD."""
+        for var, val in [("XLOADCTL", 2), ("FILEDIA", 1), ("EXPERT", 0), ("PROXYSHOW", 1)]:
+            try:
+                self.app.SetSystemVariable(var, val)
+            except Exception:
+                pass
 
-    def leer_layers(self, doc):
-        layers = {}
+    def vivo(self):
+        """Verifica que AutoCAD sigue respondiendo. Intenta varias veces antes de declarar caída."""
+        for _ in range(3):
+            try:
+                _ = self.app.Version
+                return True
+            except Exception:
+                time.sleep(1.0)
+        return False
+
+    def leer_layers_con_timeout(self, ruta, timeout=25):
+        """
+        Abre el DWG, lee los layers y cierra — todo en un hilo secundario.
+        Si tarda más de `timeout` segundos, lo cancela y retorna None.
+        Retorna: (dict_layers, None) si ok, (None, msg_error) si falla.
+        """
+        ruta_abs = os.path.abspath(ruta)
+        self._suprimir_dialogs()
+
+        layers_result = [None]
+        error_result  = [None]
+
         try:
-            col = doc.Layers
-            for i in range(col.Count):
-                try:
-                    l   = col.Item(i)
-                    aci = abs(l.Color)
-                    layers[l.Name] = {
-                        "color_aci":   aci,
-                        "color_texto": nombre_color(aci),
-                    }
-                except Exception:
-                    continue
+            stream = pythoncom.CoMarshalInterThreadInterfaceInStream(
+                pythoncom.IID_IDispatch, self.app
+            )
         except Exception as e:
-            log.warn(f"Error leyendo layers: {e}")
-        return layers
+            error_result[0] = f"Marshal falló: {e}"
+            return None, error_result[0]
+
+        def _worker():
+            pythoncom.CoInitialize()
+            doc = None
+            try:
+                app_hilo = win32com.client.Dispatch(
+                    pythoncom.CoGetInterfaceAndReleaseStream(
+                        stream, pythoncom.IID_IDispatch
+                    )
+                )
+                doc = app_hilo.Documents.Open(ruta_abs, True)
+                time.sleep(0.4)
+
+                layers = {}
+                col = doc.Layers
+                for i in range(col.Count):
+                    try:
+                        l   = col.Item(i)
+                        aci = abs(l.Color)
+                        layers[l.Name] = {
+                            "color_aci":   aci,
+                            "color_texto": nombre_color(aci),
+                        }
+                    except Exception:
+                        continue
+                layers_result[0] = layers
+
+            except Exception as e:
+                error_result[0] = str(e)[:80]
+            finally:
+                if doc is not None:
+                    try:
+                        doc.Close(False)
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout)
+
+        if t.is_alive():
+            log.warn(f"  TIMEOUT ({timeout}s) — saltando archivo colgado")
+            # Intentar cerrar el documento trabado desde el hilo principal
+            try:
+                for i in range(self.app.Documents.Count - 1, -1, -1):
+                    try:
+                        doc = self.app.Documents.Item(i)
+                        if "Drawing1" not in doc.Name:
+                            doc.Close(False)
+                            time.sleep(1.5)
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return None, "TIMEOUT — archivo colgado saltado"
+
+        if error_result[0]:
+            return None, error_result[0]
+
+        return layers_result[0], None
+
+    def cerrar_docs_abiertos(self):
+        """Cierra cualquier documento que haya quedado abierto (excepto Drawing1)."""
+        try:
+            cerrados = 0
+            for i in range(self.app.Documents.Count - 1, -1, -1):
+                try:
+                    doc = self.app.Documents.Item(i)
+                    if "Drawing1" not in doc.Name:
+                        doc.Close(False)
+                        time.sleep(0.1)
+                        cerrados += 1
+                except Exception:
+                    pass
+            return cerrados
+        except Exception:
+            return 0
 
     def quit(self):
+        self._restaurar_dialogs()   # dejar AutoCAD usable después del proceso
+        self.cerrar_docs_abiertos()
         try:
             pythoncom.CoUninitialize()
         except Exception:
@@ -201,14 +311,13 @@ def evaluar_estado(layers_dict):
             tiene_k2  = True; nombre_k2 = nombre
             color_k2  = info["color_texto"]
             k2_verde  = info["color_aci"] == COLOR_VERDE_ACI
-
+            
     if k_azul and k2_verde:
         estado = "ACTUALIZADA"
     elif not tiene_k and not tiene_k2:
         estado = "VIEJA"
     else:
         estado = "INCOMPLETA"
-
     return {
         "estado":    estado,
         "tiene_k":   tiene_k,  "nombre_k":  nombre_k,  "color_k":  color_k,  "k_azul":   k_azul,
@@ -250,12 +359,18 @@ def recolectar_dwgs(ruta_artes):
 # ──────────────────────────────────────────────────────────
 # PROCESAR UN VEHÍCULO COMPLETO
 # ──────────────────────────────────────────────────────────
-def procesar_vehiculo(vehiculo, ruta_vehiculo, motor):
+def procesar_vehiculo(vehiculo, ruta_vehiculo, motor, completados,
+                      filas_previas=None, rutas_ya_procesadas=None):
     """
     Procesa todos los DWGs de un vehículo.
-    Retorna lista de filas. Si AutoCAD se cae retorna None.
+    - filas_previas: filas ya guardadas en checkpoint para este vehículo (retoma)
+    - rutas_ya_procesadas: set de rutas ya hechas para no repetirlas
+    Guarda checkpoint cada GUARDAR_CADA_N archivos.
+    Retorna lista de filas completas, o None si AutoCAD se cayó.
     """
-    filas = []
+    filas                = list(filas_previas or [])
+    rutas_ya_procesadas  = set(rutas_ya_procesadas or [f["ruta"] for f in filas])
+    nuevos_desde_guardado = 0
 
     modelos = sorted(d for d in os.listdir(ruta_vehiculo)
                      if os.path.isdir(os.path.join(ruta_vehiculo, d)))
@@ -268,7 +383,6 @@ def procesar_vehiculo(vehiculo, ruta_vehiculo, motor):
         for version in versiones:
             ruta_version = os.path.join(ruta_modelo, version)
 
-            # Buscar carpeta ARTES
             ruta_artes = None
             try:
                 for sub in os.listdir(ruta_version):
@@ -286,14 +400,16 @@ def procesar_vehiculo(vehiculo, ruta_vehiculo, motor):
             if not dwgs:
                 continue
 
-            log.info(f"    {modelo} / {version}: {len(dwgs)} DWG(s)")
+            pendientes_version = [(o, p) for o, p in dwgs if p not in rutas_ya_procesadas]
+            saltados_version   = len(dwgs) - len(pendientes_version)
 
-            for origen, dwg_path in dwgs:
-                # Verificar que AutoCAD sigue vivo antes de cada archivo
-                if not motor.vivo():
-                    log.error("AutoCAD dejó de responder. Guardando progreso...")
-                    return None   # señal de caída
+            if saltados_version:
+                log.info(f"    {modelo} / {version}: {len(dwgs)} DWG(s)  "
+                         f"({saltados_version} ya procesados, {len(pendientes_version)} pendientes)")
+            else:
+                log.info(f"    {modelo} / {version}: {len(dwgs)} DWG(s)")
 
+            for origen, dwg_path in pendientes_version:
                 nombre = os.path.basename(dwg_path)
                 fila = {
                     "vehiculo": vehiculo, "modelo": modelo, "version": version,
@@ -306,34 +422,43 @@ def procesar_vehiculo(vehiculo, ruta_vehiculo, motor):
                     "detalle_error": "",
                 }
 
-                doc = motor.abrir(dwg_path)
-                if doc is None:
-                    fila["detalle_error"] = "No se pudo abrir"
-                    log.warn(f"      ERROR abriendo: {nombre}")
+                layers, err = motor.leer_layers_con_timeout(dwg_path)
+                motor.cerrar_docs_abiertos()
+
+                if layers is None:
+                    if not motor.vivo():
+                        log.error("AutoCAD dejó de responder. Guardando progreso...")
+                        checkpoint_guardar(ARCHIVO_CHECKPOINT, completados,
+                                           vehiculo, filas)
+                        return None
+                    fila["detalle_error"] = err or "No se pudo leer"
+                    log.warn(f"      ERROR: {nombre}  [{fila['detalle_error'][:50]}]")
                 else:
-                    try:
-                        layers = motor.leer_layers(doc)
-                        ev = evaluar_estado(layers)
-                        fila.update(ev)
-                        fila["total_layers"] = len(layers)
-                        fila["lista_layers"] = " | ".join(
-                            f"{n}({i['color_texto']})"
-                            for n, i in sorted(layers.items())
-                        )
-                        icono = {"ACTUALIZADA": "✓", "VIEJA": "✗", "INCOMPLETA": "!"}.get(ev["estado"], "?")
-                        log.info(
-                            f"      {icono} {ev['estado']:<14}  "
-                            f"K={'azul✓' if ev['k_azul'] else ('no azul✗' if ev['tiene_k'] else 'NO')}  "
-                            f"K2={'verde✓' if ev['k2_verde'] else ('no verde✗' if ev['tiene_k2'] else 'NO')}  "
-                            f"{nombre}"
-                        )
-                    except Exception as e:
-                        fila["detalle_error"] = str(e)[:80]
-                        log.warn(f"      ERROR analizando {nombre}: {e}")
-                    finally:
-                        motor.cerrar(doc)
+                    ev = evaluar_estado(layers)
+                    fila.update(ev)
+                    fila["total_layers"] = len(layers)
+                    fila["lista_layers"] = " | ".join(
+                        f"{n}({i['color_texto']})"
+                        for n, i in sorted(layers.items())
+                    )
+                    icono = {"ACTUALIZADA": "✓", "VIEJA": "✗", "INCOMPLETA": "!"}.get(ev["estado"], "?")
+                    log.info(
+                        f"      {icono} {ev['estado']:<14}  "
+                        f"K={'azul✓' if ev['k_azul'] else ('no azul✗' if ev['tiene_k'] else 'NO')}  "
+                        f"K2={'verde✓' if ev['k2_verde'] else ('no verde✗' if ev['tiene_k2'] else 'NO')}  "
+                        f"{nombre}"
+                    )
 
                 filas.append(fila)
+                rutas_ya_procesadas.add(dwg_path)
+                nuevos_desde_guardado += 1
+
+                # Guardar checkpoint cada N archivos
+                if nuevos_desde_guardado >= GUARDAR_CADA_N:
+                    checkpoint_guardar(ARCHIVO_CHECKPOINT, completados,
+                                       vehiculo, filas)
+                    log.info(f"      [checkpoint] {len(filas)} DWG(s) guardados en {vehiculo}")
+                    nuevos_desde_guardado = 0
 
     return filas
 
@@ -341,60 +466,62 @@ def procesar_vehiculo(vehiculo, ruta_vehiculo, motor):
 # ──────────────────────────────────────────────────────────
 # ESCANEO PRINCIPAL CON CHECKPOINT
 # ──────────────────────────────────────────────────────────
-def escanear(ruta_base, motor, datos_previos):
+def escanear(ruta_base, motor, completados, vehiculo_parcial, filas_parciales):
     """
-    Recorre todos los vehículos. Guarda checkpoint tras cada uno.
-    Si un vehículo ya está en datos_previos lo salta.
+    Recorre todos los vehículos con checkpoint por archivo y por vehículo.
     Retorna (datos_completos, completado_sin_errores)
     """
-    datos = dict(datos_previos)   # copia del checkpoint cargado
-
     if not os.path.exists(ruta_base):
         log.error(f"Ruta base no accesible: {ruta_base}")
-        return datos, False
+        return completados, False
 
     vehiculos = sorted(d for d in os.listdir(ruta_base)
                        if os.path.isdir(os.path.join(ruta_base, d)))
 
-    ya_procesados = [v for v in vehiculos if v in datos]
-    pendientes    = [v for v in vehiculos if v not in datos]
+    ya_listos  = [v for v in vehiculos if v in completados and v != vehiculo_parcial]
+    pendientes = [v for v in vehiculos if v not in completados]
+    # Si había uno en curso, asegurarse de que esté primero en pendientes
+    if vehiculo_parcial and vehiculo_parcial in pendientes:
+        pendientes = [vehiculo_parcial] + [v for v in pendientes if v != vehiculo_parcial]
+    elif vehiculo_parcial and vehiculo_parcial not in completados:
+        pendientes = [vehiculo_parcial] + pendientes
 
     log.info(f"Vehículos totales    : {len(vehiculos)}")
-    log.info(f"Ya procesados        : {len(ya_procesados)}")
+    log.info(f"Ya completados       : {len(ya_listos)}")
+    if vehiculo_parcial:
+        log.info(f"En curso (parcial)   : {vehiculo_parcial} "
+                 f"({len(filas_parciales)} DWG(s) ya procesados)")
     log.info(f"Pendientes           : {len(pendientes)}")
-
-    if ya_procesados:
-        log.info(f"Saltando: {', '.join(ya_procesados)}")
 
     for idx, vehiculo in enumerate(pendientes, 1):
         ruta_vehiculo = os.path.join(ruta_base, vehiculo)
         log.info("=" * 70)
         log.info(f"[{idx}/{len(pendientes)}] VEHÍCULO: {vehiculo}")
 
-        filas = procesar_vehiculo(vehiculo, ruta_vehiculo, motor)
+        # Si es el vehículo parcial, retomar desde donde estaba
+        fp = filas_parciales if vehiculo == vehiculo_parcial else []
+
+        filas = procesar_vehiculo(vehiculo, ruta_vehiculo, motor,
+                                  completados, filas_previas=fp)
 
         if filas is None:
-            # AutoCAD se cayó — guardar lo que hay y salir
             log.error("Proceso interrumpido por caída de AutoCAD.")
             log.error(f"Progreso guardado en: {ARCHIVO_CHECKPOINT}")
             log.error("Vuelve a abrir AutoCAD y ejecuta el script de nuevo para continuar.")
-            checkpoint_guardar(ARCHIVO_CHECKPOINT, datos)
-            return datos, False
+            return completados, False
 
-        datos[vehiculo] = filas
-
-        # Contar resultados del vehículo para el log
+        completados[vehiculo] = filas
         act  = sum(1 for f in filas if f["estado"] == "ACTUALIZADA")
         viej = sum(1 for f in filas if f["estado"] == "VIEJA")
         inc  = sum(1 for f in filas if f["estado"] == "INCOMPLETA")
         err  = sum(1 for f in filas if f["estado"] == "ERROR")
-        log.ok(f"Vehículo guardado: {vehiculo} — "
+        log.ok(f"Vehículo completo: {vehiculo} — "
                f"{len(filas)} DWG(s)  ✓{act} ✗{viej} !{inc} E{err}")
 
-        # Guardar checkpoint inmediatamente después de cada vehículo
-        checkpoint_guardar(ARCHIVO_CHECKPOINT, datos)
+        # Vehículo terminado: guardar como completo y limpiar en_curso
+        checkpoint_guardar(ARCHIVO_CHECKPOINT, completados)
 
-    return datos, True
+    return completados, True
 
 
 # ──────────────────────────────────────────────────────────
@@ -641,12 +768,12 @@ def main():
 
     # ── Modo: solo generar Excel desde checkpoint ──────
     if args.solo_excel:
-        datos = checkpoint_cargar(ARCHIVO_CHECKPOINT)
-        if not datos:
+        completados, _, _ = checkpoint_cargar(ARCHIVO_CHECKPOINT)
+        if not completados:
             log.error("No hay checkpoint guardado. Ejecuta sin --solo-excel primero.")
             return
         nombre = f"Auditoria_Layers_K_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        crear_excel(datos, nombre)
+        crear_excel(completados, nombre)
         return
 
     # ── Reiniciar desde cero ───────────────────────────
@@ -655,13 +782,14 @@ def main():
         log.info("Checkpoint borrado. Empezando desde cero.")
 
     # ── Cargar progreso previo ─────────────────────────
-    datos_previos = checkpoint_cargar(ARCHIVO_CHECKPOINT)
-    if datos_previos:
-        log.info(f"Reanudando desde checkpoint: {len(datos_previos)} vehículo(s) ya listos")
+    completados, vehiculo_parcial, filas_parciales = checkpoint_cargar(ARCHIVO_CHECKPOINT)
+    hay_progreso = bool(completados or vehiculo_parcial)
+
+    if hay_progreso:
         resp = input("  ¿Continuar desde donde se quedó? [S/n]: ").strip().lower()
         if resp == "n":
             checkpoint_borrar(ARCHIVO_CHECKPOINT)
-            datos_previos = {}
+            completados, vehiculo_parcial, filas_parciales = {}, None, []
             log.info("Checkpoint descartado. Empezando desde cero.")
 
     log.info("\nIMPORTANTE: AutoCAD debe estar abierto (sin archivos) antes de continuar.")
@@ -670,7 +798,8 @@ def main():
     motor = AutoCAD()
 
     t0 = time.time()
-    datos, completado = escanear(RUTA_BASE, motor, datos_previos)
+    datos, completado = escanear(RUTA_BASE, motor,
+                                 completados, vehiculo_parcial, filas_parciales)
     motor.quit()
     duracion = time.time() - t0
 
